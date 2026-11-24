@@ -498,9 +498,6 @@ public sealed class DocumentOperation
     /// <param name="filePath">The path where the output file will be saved.</param>
     public void Save(string filePath)
     {
-        if (File.Exists(filePath))
-            File.Delete(filePath);
-        
         Configuration.OutputFile = filePath;
         var json = QpdfJobSerializer.Serialize(Configuration);
 
@@ -508,6 +505,10 @@ public sealed class DocumentOperation
             ? xmp => XmpMetadataExtension.Extend(xmp, MetadataExtensions)
             : null;
 
-        QpdfAPI.ExecuteJob(json, transformMetadata);
+        QpdfAPI.ExecuteJob(json, transformMetadata, beforeWrite: () =>
+        {
+            if (File.Exists(filePath))
+                File.Delete(filePath);
+        });
     }
 }

@@ -12,7 +12,7 @@ static class QpdfAPI
         return API.questpdf_get_compatibility_version();
     }
     
-    public static void ExecuteJob(string jobJson, Func<byte[], byte[]>? transformMetadata = null)
+    public static void ExecuteJob(string jobJson, Func<byte[], byte[]>? transformMetadata = null, Action? beforeWrite = null)
     {
         QpdfNativeDependencyCompatibilityChecker.Test();
         
@@ -46,6 +46,7 @@ static class QpdfAPI
                 TransformMetadata(transformMetadata);
 
             // write the output file
+            beforeWrite?.Invoke();
             ThrowOnJobError(API.qpdfjob_write_qpdf(jobHandle, documentHandle));
         }
         finally
