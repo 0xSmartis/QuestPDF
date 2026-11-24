@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 using QuestPDF.Skia;
@@ -12,7 +13,8 @@ static class QpdfAPI
         return API.questpdf_get_compatibility_version();
     }
     
-    public static void ExecuteJob(string jobJson, Func<byte[], byte[]>? transformMetadata = null, Action? beforeWrite = null)
+    public static void ExecuteJob(string jobJson, Func<byte[], byte[]>? transformMetadata = null,
+        IReadOnlyList<(string Title, int PageNumber)>? bookmarks = null, Action? beforeWrite = null)
     {
         QpdfNativeDependencyCompatibilityChecker.Test();
         
@@ -44,6 +46,9 @@ static class QpdfAPI
 
             if (transformMetadata != null)
                 TransformMetadata(transformMetadata);
+
+            if (bookmarks is { Count: > 0 })
+                AddBookmarks(documentHandle, bookmarks);
 
             // write the output file
             beforeWrite?.Invoke();
@@ -97,6 +102,115 @@ static class QpdfAPI
             // 0 = success, 1 = undefined, 2 = error, 3 = warning
             if (jobResultId == JobResultError)
                 throw new Exception($"QuestPDF could not perform document operation:\n\n{error}");
+        }
+    }
+
+    private static void AddBookmarks(IntPtr document, IReadOnlyList<(string Title, int PageNumber)> bookmarks)
+    {
+        API.qpdf_silence_errors(document);
+        var pageCount = API.qpdf_get_num_pages(document);
+        ThrowOnDocumentError();
+
+        foreach (var (_, pageNumber) in bookmarks)
+        {
+            if (pageNumber > pageCount)
+                throw new ArgumentOutOfRangeException(nameof(pageNumber), pageNumber, $"The output document has {pageCount} pages.");
+        }
+
+        var catalog = API.qpdf_get_root(document);
+        var outline = GetKey(catalog, "/Outlines");
+
+        if (IsNull(outline))
+        {
+            outline = NewIndirectObject("<< /Type /Outlines >>");
+            SetKey(catalog, "/Outlines", outline);
+        }
+
+        ThrowOnDocumentError();
+
+        if (!IsIndirectDictionary(outline))
+            throw new InvalidOperationException("The PDF contains an invalid outline dictionary.");
+
+        var first = GetKey(outline, "/First");
+        var last = GetKey(outline, "/Last");
+        if (IsNull(first) != IsNull(last) ||
+            (!IsNull(last) && (!IsIndirectDictionary(first) || !IsIndirectDictionary(last) || !IsNull(GetKey(last, "/Next")))))
+            throw new InvalidOperationException("The PDF contains an invalid outline.");
+
+        var visibleCount = GetVisibleCount();
+
+        foreach (var (title, pageNumber) in bookmarks)
+        {
+            var item = NewIndirectObject("<< /Dest [null /Fit] >>");
+            var titleBytes = Encoding.UTF8.GetBytes(title);
+            var titleObject = API.qpdf_oh_new_binary_unicode_string(document, titleBytes, (UIntPtr)titleBytes.Length);
+            var page = API.qpdf_get_page_n(document, (UIntPtr)(pageNumber - 1));
+
+            API.qpdf_oh_set_array_item(document, GetKey(item, "/Dest"), 0, page);
+            SetKey(item, "/Title", titleObject);
+            SetKey(item, "/Parent", outline);
+
+            if (IsNull(last))
+                SetKey(outline, "/First", item);
+            else
+            {
+                SetKey(last, "/Next", item);
+                SetKey(item, "/Prev", last);
+            }
+
+            last = item;
+        }
+
+        SetKey(outline, "/Last", last);
+        SetKey(outline, "/Count", API.qpdf_oh_new_integer(document, visibleCount + bookmarks.Count));
+        ThrowOnDocumentError();
+
+        uint NewIndirectObject(string value) => API.qpdf_make_indirect_object(document, API.qpdf_oh_parse(document, value));
+        uint GetKey(uint item, string key) => API.qpdf_oh_get_key(document, item, key);
+        bool IsNull(uint item) => API.qpdf_oh_is_null(document, item) != 0;
+        bool IsIndirectDictionary(uint item) => API.qpdf_oh_get_object_id(document, item) > 0 && API.qpdf_oh_is_dictionary(document, item) != 0;
+        void SetKey(uint item, string key, uint value) => API.qpdf_oh_replace_key(document, item, key, value);
+
+        long GetVisibleCount()
+        {
+            if (IsNull(first))
+                return 0;
+
+            if (TryGetCount(outline, out var count) && count > 0)
+                return count;
+
+            // A missing root count can be reconstructed from the expanded top-level items.
+            var visible = 0L;
+            var visited = new HashSet<int>();
+            for (var item = first; !IsNull(item); item = GetKey(item, "/Next"))
+            {
+                var id = API.qpdf_oh_get_object_id(document, item);
+                if (id == 0 || !visited.Add(id))
+                    throw new InvalidOperationException("The PDF contains an invalid outline.");
+
+                visible++;
+                if (TryGetCount(item, out var childCount) && childCount > 0)
+                    visible += childCount;
+            }
+
+            return visible;
+        }
+
+        bool TryGetCount(uint item, out long count) =>
+            API.qpdf_oh_get_value_as_longlong(document, GetKey(item, "/Count"), out count) != 0;
+
+        unsafe void ThrowOnDocumentError()
+        {
+            var error = API.qpdf_get_error(document);
+            if (error == IntPtr.Zero)
+                return;
+
+            var message = (byte*)API.qpdf_get_error_full_text(document, error);
+            var length = 0;
+            while (message[length] != 0)
+                length++;
+
+            throw new InvalidOperationException(Encoding.UTF8.GetString(message, length));
         }
     }
     
@@ -164,6 +278,59 @@ static class QpdfAPI
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void qpdf_oh_free_buffer(ref IntPtr buffer);
+
+        /* BOOKMARKS */
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void qpdf_silence_errors(IntPtr document);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr qpdf_get_error(IntPtr document);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr qpdf_get_error_full_text(IntPtr document, IntPtr error);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int qpdf_get_num_pages(IntPtr document);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint qpdf_get_page_n(IntPtr document, UIntPtr pageIndex);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint qpdf_get_root(IntPtr document);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint qpdf_make_indirect_object(IntPtr document, uint item);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint qpdf_oh_parse(IntPtr document, string value);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int qpdf_oh_is_null(IntPtr document, uint item);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int qpdf_oh_is_dictionary(IntPtr document, uint item);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int qpdf_oh_get_object_id(IntPtr document, uint item);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint qpdf_oh_get_key(IntPtr document, uint item, string key);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void qpdf_oh_replace_key(IntPtr document, uint item, string key, uint value);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int qpdf_oh_get_value_as_longlong(IntPtr document, uint item, out long value);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint qpdf_oh_new_integer(IntPtr document, long value);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint qpdf_oh_new_binary_unicode_string(IntPtr document, byte[] value, UIntPtr length);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void qpdf_oh_set_array_item(IntPtr document, uint array, int index, uint item);
         
         /* LOGGING */
         

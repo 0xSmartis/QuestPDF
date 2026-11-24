@@ -44,6 +44,52 @@ public class DocumentOperationTests
         using var inspector = PdfInspector.Load(File.ReadAllBytes("operation-merged.pdf"));
         Assert.That(inspector.Pages.Count(), Is.EqualTo(3 + 5 + 7));
     }
+
+    [Test]
+    public void AddBookmarksToMergedDocument()
+    {
+        GenerateSampleDocument("bookmarks-report.pdf", Colors.Red.Medium, 2);
+        GenerateSampleDocument("bookmarks-appendix.pdf", Colors.Blue.Medium, 1);
+
+        DocumentOperation
+            .LoadFile("bookmarks-report.pdf")
+            .AddBookmark("Report", 1)
+            .Save("bookmarks-existing.pdf");
+
+        DocumentOperation
+            .LoadFile("bookmarks-existing.pdf")
+            .TakePages("2,1")
+            .MergeFile("bookmarks-appendix.pdf")
+            .AddBookmark("Anhang – Überblick 🎉", 3)
+            .AddBookmark("Cover", 1)
+            .Save("operation-bookmarks.pdf");
+
+        using var inspector = PdfInspector.Load(File.ReadAllBytes("operation-bookmarks.pdf"));
+        var outlines = inspector.Root.GetProperty("outlines").EnumerateArray().ToArray();
+
+        Assert.That(outlines.Select(outline => outline.GetProperty("title").GetString()),
+            Is.EqualTo(new[] { "Report", "Anhang – Überblick 🎉", "Cover" }));
+        Assert.That(outlines.Select(outline => outline.GetProperty("destpageposfrom1").GetInt32()),
+            Is.EqualTo(new[] { 2, 3, 1 }));
+    }
+
+    [Test]
+    public void BookmarkPageMustExistInOutput()
+    {
+        const string outputPath = "operation-invalid-bookmark.pdf";
+        GenerateSampleDocument("bookmark-out-of-range.pdf", Colors.Red.Medium, 2);
+        GenerateSampleDocument(outputPath, Colors.Blue.Medium, 1);
+        var previousOutput = File.ReadAllBytes(outputPath);
+
+        var operation = DocumentOperation
+            .LoadFile("bookmark-out-of-range.pdf")
+            .TakePages("2")
+            .AddBookmark("Second page", 2);
+
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(() => operation.Save(outputPath));
+        Assert.That(exception!.ParamName, Is.EqualTo("pageNumber"));
+        Assert.That(File.ReadAllBytes(outputPath), Is.EqualTo(previousOutput));
+    }
     
     [Test]
     public void OverlayTest()

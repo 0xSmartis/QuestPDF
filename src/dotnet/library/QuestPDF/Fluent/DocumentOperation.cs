@@ -207,6 +207,7 @@ public sealed class DocumentOperation
     
     internal JobConfiguration Configuration { get; private set; }
     private List<string> MetadataExtensions { get; } = new();
+    private List<(string Title, int PageNumber)>? Bookmarks { get; set; }
 
     private DocumentOperation()
     {
@@ -321,6 +322,23 @@ public sealed class DocumentOperation
     public DocumentOperation ExtendMetadata(string metadata)
     {
         MetadataExtensions.Add(metadata);
+        return this;
+    }
+
+    /// <summary>
+    /// Appends a top-level bookmark to the output document's outline.
+    /// </summary>
+    /// <param name="title">The text displayed for the bookmark.</param>
+    /// <param name="pageNumber">The one-based page number after page selection and merging.</param>
+    public DocumentOperation AddBookmark(string title, int pageNumber)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+            throw new ArgumentException("The bookmark title must not be empty.", nameof(title));
+
+        if (pageNumber < 1)
+            throw new ArgumentOutOfRangeException(nameof(pageNumber));
+
+        (Bookmarks ??= new()).Add((title, pageNumber));
         return this;
     }
     
@@ -505,7 +523,7 @@ public sealed class DocumentOperation
             ? xmp => XmpMetadataExtension.Extend(xmp, MetadataExtensions)
             : null;
 
-        QpdfAPI.ExecuteJob(json, transformMetadata, beforeWrite: () =>
+        QpdfAPI.ExecuteJob(json, transformMetadata, Bookmarks, () =>
         {
             if (File.Exists(filePath))
                 File.Delete(filePath);
