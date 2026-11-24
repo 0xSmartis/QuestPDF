@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using QuestPDF.Helpers;
 using QuestPDF.Qpdf;
 
@@ -11,6 +12,53 @@ namespace QuestPDF.Fluent;
 /// </summary>
 public sealed class DocumentOperation
 {
+    /// <summary>
+    /// A bookmark in a PDF document's outline.
+    /// </summary>
+    public sealed class Bookmark
+    {
+        internal Bookmark(string title, int? pageNumber, IReadOnlyList<Bookmark> children)
+        {
+            Title = title;
+            PageNumber = pageNumber;
+            Children = children.Count == 0 ? Array.Empty<Bookmark>() : Array.AsReadOnly(children.ToArray());
+            EntryCount = 1 + Children.Sum(child => child.EntryCount);
+        }
+
+        /// <summary>The text displayed for the bookmark.</summary>
+        public string Title { get; }
+
+        /// <summary>The one-based destination page, or null if the bookmark has no resolved local destination.</summary>
+        public int? PageNumber { get; }
+
+        /// <summary>The nested bookmarks in outline order.</summary>
+        public IReadOnlyList<Bookmark> Children { get; }
+
+        internal int EntryCount { get; }
+    }
+
+    /// <summary>
+    /// The page count and bookmark outline of a PDF file.
+    /// </summary>
+    public sealed class DocumentInfo
+    {
+        internal DocumentInfo(int pageCount, IReadOnlyList<Bookmark> bookmarks)
+        {
+            PageCount = pageCount;
+            Bookmarks = bookmarks.Count == 0 ? Array.Empty<Bookmark>() : Array.AsReadOnly(bookmarks.ToArray());
+            BookmarkCount = Bookmarks.Sum(bookmark => bookmark.EntryCount);
+        }
+
+        /// <summary>The number of pages in the PDF.</summary>
+        public int PageCount { get; }
+
+        /// <summary>The number of bookmarks at all levels of the outline.</summary>
+        public int BookmarkCount { get; }
+
+        /// <summary>The top-level bookmarks in outline order.</summary>
+        public IReadOnlyList<Bookmark> Bookmarks { get; }
+    }
+
     /// <summary>
     /// Represents configuration options for applying an overlay or underlay to a PDF document using qpdf.
     /// </summary>
@@ -230,6 +278,17 @@ public sealed class DocumentOperation
                 Password = password
             }
         };
+    }
+
+    /// <summary>
+    /// Reads the page count and bookmark outline of a PDF file.
+    /// </summary>
+    /// <param name="filePath">The path to the PDF file to inspect.</param>
+    /// <param name="password">The password for the PDF file, if it is password-protected.</param>
+    /// <include file='../Resources/Documentation.xml' path='documentation/doc[@for="filePath.remarks"]/*' />
+    public static DocumentInfo InspectFile(string filePath, string? password = null)
+    {
+        return QpdfAPI.InspectFile(PathHelpers.ResolveResourceFilePath(filePath), password);
     }
     
     /// <summary>

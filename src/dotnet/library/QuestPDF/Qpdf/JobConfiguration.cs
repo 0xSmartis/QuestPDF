@@ -13,7 +13,10 @@ sealed class JobConfiguration
     [Name("inputFile")] public string InputFile { get; set; }
     [Name("password")] public string? Password { get; set; }
     
-    [Name("outputFile")] public string OutputFile { get; set; }
+    [Name("outputFile")] public string? OutputFile { get; set; }
+    [Name("showNpages")] public string? ShowNpages { get; set; }
+    [Name("json")] public string? Json { get; set; }
+    [Name("jsonKey")] public ICollection<string>? JsonKey { get; set; }
     
     [Name("pages")] public ICollection<PageConfiguration>? Pages { get; set; }
     [Name("overlay")] public ICollection<LayerConfiguration>? Overlay { get; set; }

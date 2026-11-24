@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text;
 using NUnit.Framework;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
@@ -89,6 +90,61 @@ public class DocumentOperationTests
         var exception = Assert.Throws<ArgumentOutOfRangeException>(() => operation.Save(outputPath));
         Assert.That(exception!.ParamName, Is.EqualTo("pageNumber"));
         Assert.That(File.ReadAllBytes(outputPath), Is.EqualTo(previousOutput));
+    }
+
+    [Test]
+    public void InspectFileWithoutBookmarks()
+    {
+        const string inputPath = "inspect-no-bookmarks.pdf";
+        GenerateSampleDocument(inputPath, Colors.Red.Medium, 2);
+        var original = File.ReadAllBytes(inputPath);
+
+        var info = DocumentOperation.InspectFile(inputPath);
+
+        Assert.That(info.PageCount, Is.EqualTo(2));
+        Assert.That(info.BookmarkCount, Is.Zero);
+        Assert.That(info.Bookmarks, Is.Empty);
+        Assert.That(File.ReadAllBytes(inputPath), Is.EqualTo(original));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void InspectFileWithNestedBookmarks(bool encrypted)
+    {
+        const string title = "Anhang – Überblick 🎉";
+        const string password = "zażółć gęślą";
+        var inputPath = $"inspect-bookmarks-{encrypted}.pdf";
+        GenerateDocumentWithBookmarks(inputPath, title);
+
+        if (encrypted)
+        {
+            const string encryptedPath = "inspect-bookmarks-encrypted.pdf";
+            DocumentOperation
+                .LoadFile(inputPath)
+                .Encrypt(new DocumentOperation.Encryption256Bit
+                {
+                    UserPassword = password,
+                    OwnerPassword = "owner_password"
+                })
+                .Save(encryptedPath);
+
+            inputPath = encryptedPath;
+            Assert.Catch(() => DocumentOperation.InspectFile(inputPath, "wrong_password"));
+        }
+
+        var info = DocumentOperation.InspectFile(inputPath, encrypted ? password : null);
+
+        Assert.That(info.PageCount, Is.EqualTo(2));
+        Assert.That(info.BookmarkCount, Is.EqualTo(5));
+        Assert.That(info.Bookmarks.Select(bookmark => bookmark.Title),
+            Is.EqualTo(new[] { "Report", "Website", "Legacy destination", "Missing destination" }));
+        Assert.That(info.Bookmarks.Select(bookmark => bookmark.PageNumber),
+            Is.EqualTo(new int?[] { 1, null, 1, null }));
+
+        var child = info.Bookmarks.First().Children.Single();
+        Assert.That(child.Title, Is.EqualTo(title));
+        Assert.That(child.PageNumber, Is.EqualTo(2));
+        Assert.That(child.Children, Is.Empty);
     }
     
     [Test]
@@ -491,6 +547,43 @@ public class DocumentOperationTests
         Assert.That(metadata, Does.Contain("http://purl.org/dc/elements/1.1/"));
     }
     
+    private static void GenerateDocumentWithBookmarks(string filePath, string childTitle)
+    {
+        var unicodeTitle = Convert.ToHexString(Encoding.BigEndianUnicode.GetBytes(childTitle));
+        var objects = new[]
+        {
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Names << /Dests 11 0 R >> /Dests << /legacy [3 0 R /Fit] >> >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> >>",
+            "<< /Type /Outlines /First 6 0 R /Last 10 0 R /Count 5 >>",
+            "<< /Title (Report) /Parent 5 0 R /Next 8 0 R /First 7 0 R /Last 7 0 R /Count 1 /Dest [3 0 R /Fit] >>",
+            $"<< /Title <FEFF{unicodeTitle}> /Parent 6 0 R /A << /S /GoTo /D (appendix) >> >>",
+            "<< /Title (Website) /Parent 5 0 R /Prev 6 0 R /Next 9 0 R /A << /S /URI /URI (https://example.com) >> >>",
+            "<< /Title (Legacy destination) /Parent 5 0 R /Prev 8 0 R /Next 10 0 R /Dest /legacy >>",
+            "<< /Title (Missing destination) /Parent 5 0 R /Prev 9 0 R /Dest (missing) >>",
+            "<< /Kids [12 0 R] >>",
+            "<< /Limits [(appendix) (appendix)] /Names [(appendix) << /D [4 0 R /Fit] >>] >>"
+        };
+
+        // The fixture uses ASCII so each character contributes one byte to the cross-reference offsets.
+        var pdf = new StringBuilder("%PDF-1.4\n");
+        var offsets = new int[objects.Length];
+        for (var index = 0; index < objects.Length; index++)
+        {
+            offsets[index] = pdf.Length;
+            pdf.Append($"{index + 1} 0 obj\n{objects[index]}\nendobj\n");
+        }
+
+        var startXref = pdf.Length;
+        pdf.Append($"xref\n0 {objects.Length + 1}\n0000000000 65535 f \n");
+        foreach (var offset in offsets)
+            pdf.Append($"{offset:D10} 00000 n \n");
+
+        pdf.Append($"trailer\n<< /Size {objects.Length + 1} /Root 1 0 R >>\nstartxref\n{startXref}\n%%EOF\n");
+        File.WriteAllText(filePath, pdf.ToString(), Encoding.ASCII);
+    }
+
     private void GenerateSampleDocument(string filePath, Color color, int length)
     {
         Document

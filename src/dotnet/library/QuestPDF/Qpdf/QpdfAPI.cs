@@ -1,7 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Runtime.Serialization.Json;
 using System.Text;
+using System.Xml;
+using System.Xml.Linq;
+using QuestPDF.Fluent;
 using QuestPDF.Skia;
 
 namespace QuestPDF.Qpdf;
@@ -16,12 +21,80 @@ static class QpdfAPI
     public static void ExecuteJob(string jobJson, Func<byte[], byte[]>? transformMetadata = null,
         IReadOnlyList<(string Title, int PageNumber)>? bookmarks = null, Action? beforeWrite = null)
     {
+        WithDocument(jobJson, (job, document, checkResult) =>
+        {
+            if (transformMetadata != null)
+                TransformMetadata(job, document, transformMetadata, checkResult);
+
+            if (bookmarks is { Count: > 0 })
+                AddBookmarks(document, bookmarks);
+
+            beforeWrite?.Invoke();
+            checkResult(API.qpdfjob_write_qpdf(job, document));
+        });
+    }
+
+    public static DocumentOperation.DocumentInfo InspectFile(string filePath, string? password,
+        string? pageSelector = null, bool readBookmarks = true)
+    {
+        var configuration = new JobConfiguration
+        {
+            InputFile = filePath,
+            Password = password,
+            Pages = pageSelector == null
+                ? null
+                : new[] { new JobConfiguration.PageConfiguration { File = ".", Range = pageSelector } },
+            OutputFile = readBookmarks ? "-" : null,
+            Json = readBookmarks ? "2" : null,
+            JsonKey = readBookmarks ? new[] { "outlines" } : null,
+            ShowNpages = readBookmarks ? null : string.Empty
+        };
+
+        var pageCount = 0;
+        using var output = readBookmarks ? new MemoryStream() : null;
+        WithDocument(QpdfJobSerializer.Serialize(configuration), (job, document, checkResult) =>
+        {
+            pageCount = ReadPageCount(document);
+
+            if (output != null)
+                checkResult(API.qpdfjob_write_qpdf(job, document));
+        }, output);
+
+        if (output == null)
+            return new DocumentOperation.DocumentInfo(pageCount, Array.Empty<DocumentOperation.Bookmark>());
+
+        output.Position = 0;
+        using var reader = JsonReaderWriterFactory.CreateJsonReader(output, XmlDictionaryReaderQuotas.Max);
+        var outlines = XElement.Load(reader, LoadOptions.PreserveWhitespace).Element("outlines");
+        return new DocumentOperation.DocumentInfo(pageCount, ReadBookmarks(outlines));
+    }
+
+    private static IReadOnlyList<DocumentOperation.Bookmark> ReadBookmarks(XElement? outlines)
+    {
+        if (outlines == null)
+            return Array.Empty<DocumentOperation.Bookmark>();
+
+        var bookmarks = new List<DocumentOperation.Bookmark>();
+        foreach (var item in outlines.Elements("item"))
+        {
+            var title = item.Element("title")?.Value ?? string.Empty;
+            var destination = item.Element("destpageposfrom1");
+            var pageNumber = destination?.Attribute("type")?.Value == "number" ? (int?)destination : null;
+            var children = ReadBookmarks(item.Element("kids"));
+            bookmarks.Add(new DocumentOperation.Bookmark(title, pageNumber, children));
+        }
+
+        return bookmarks;
+    }
+
+    private static void WithDocument(string jobJson, Action<IntPtr, IntPtr, Action<int>> process,
+        MemoryStream? output = null)
+    {
         QpdfNativeDependencyCompatibilityChecker.Test();
-        
-        // create StringBuilder that will store the error message
-        var error = new StringBuilder();
+
+        using var error = new MemoryStream();
         var errorHandle = GCHandle.Alloc(error);
-        var errorPtr = GCHandle.ToIntPtr(errorHandle);
+        var outputHandle = default(GCHandle);
 
         var logger = IntPtr.Zero;
         var jobHandle = IntPtr.Zero;
@@ -31,7 +104,13 @@ static class QpdfAPI
         {
             // create logger
             logger = API.qpdflogger_create();
-            API.qpdflogger_set_error(logger, 4, LoggingCallbackPointer, errorPtr); // 4 = custom logger
+            API.qpdflogger_set_error(logger, CustomLogDestination, WriteCallbackPointer, GCHandle.ToIntPtr(errorHandle));
+
+            if (output != null)
+            {
+                outputHandle = GCHandle.Alloc(output);
+                API.qpdflogger_set_save(logger, CustomLogDestination, WriteCallbackPointer, GCHandle.ToIntPtr(outputHandle), 0);
+            }
 
             // prepare the job
             jobHandle = API.qpdfjob_init();
@@ -44,15 +123,7 @@ static class QpdfAPI
             if (documentHandle == IntPtr.Zero)
                 ThrowOnJobError(JobResultError);
 
-            if (transformMetadata != null)
-                TransformMetadata(transformMetadata);
-
-            if (bookmarks is { Count: > 0 })
-                AddBookmarks(documentHandle, bookmarks);
-
-            // write the output file
-            beforeWrite?.Invoke();
-            ThrowOnJobError(API.qpdfjob_write_qpdf(jobHandle, documentHandle));
+            process(jobHandle, documentHandle, ThrowOnJobError);
         }
         finally
         {
@@ -65,52 +136,63 @@ static class QpdfAPI
             if (logger != IntPtr.Zero)
                 API.qpdflogger_cleanup(ref logger);
 
+            if (outputHandle.IsAllocated)
+                outputHandle.Free();
+
             errorHandle.Free();
-        }
-
-        void TransformMetadata(Func<byte[], byte[]> transform)
-        {
-            ThrowOnJobError(API.questpdf_job_get_xmp_metadata(jobHandle, documentHandle, out var buffer, out var length));
-
-            if (buffer == IntPtr.Zero)
-            {
-                throw new Exception(
-                    "QuestPDF could not extend the document metadata because the document does not contain any XMP metadata. " +
-                    "If the document is generated with QuestPDF, please enable the PDF/A or PDF/UA conformance in the DocumentSettings.");
-            }
-
-            byte[] content;
-
-            try
-            {
-                content = new byte[(int)length];
-                Marshal.Copy(buffer, content, 0, content.Length);
-            }
-            finally
-            {
-                API.qpdf_oh_free_buffer(ref buffer);
-            }
-
-            content = transform(content);
-
-            // qpdf copies the content, so the managed array is needed only for the duration of the call
-            ThrowOnJobError(API.questpdf_job_set_xmp_metadata(jobHandle, documentHandle, content, (UIntPtr)content.Length));
         }
 
         void ThrowOnJobError(int jobResultId)
         {
             // 0 = success, 1 = undefined, 2 = error, 3 = warning
-            if (jobResultId == JobResultError)
-                throw new Exception($"QuestPDF could not perform document operation:\n\n{error}");
+            if (jobResultId != JobResultError)
+                return;
+
+            var message = Encoding.UTF8.GetString(error.GetBuffer(), 0, (int)error.Length);
+            throw new Exception($"QuestPDF could not perform document operation:\n\n{message}");
         }
+    }
+
+    private static void TransformMetadata(IntPtr job, IntPtr document, Func<byte[], byte[]> transform, Action<int> checkResult)
+    {
+        checkResult(API.questpdf_job_get_xmp_metadata(job, document, out var buffer, out var length));
+
+        if (buffer == IntPtr.Zero)
+        {
+            throw new Exception(
+                "QuestPDF could not extend the document metadata because the document does not contain any XMP metadata. " +
+                "If the document is generated with QuestPDF, please enable the PDF/A or PDF/UA conformance in the DocumentSettings.");
+        }
+
+        byte[] content;
+
+        try
+        {
+            content = new byte[(int)length];
+            Marshal.Copy(buffer, content, 0, content.Length);
+        }
+        finally
+        {
+            API.qpdf_oh_free_buffer(ref buffer);
+        }
+
+        content = transform(content);
+
+        // qpdf copies the content, so the managed array is needed only for the duration of the call
+        checkResult(API.questpdf_job_set_xmp_metadata(job, document, content, (UIntPtr)content.Length));
+    }
+
+    private static int ReadPageCount(IntPtr document)
+    {
+        API.qpdf_silence_errors(document);
+        var pageCount = API.qpdf_get_num_pages(document);
+        ThrowOnDocumentError(document);
+        return pageCount;
     }
 
     private static void AddBookmarks(IntPtr document, IReadOnlyList<(string Title, int PageNumber)> bookmarks)
     {
-        API.qpdf_silence_errors(document);
-        var pageCount = API.qpdf_get_num_pages(document);
-        ThrowOnDocumentError();
-
+        var pageCount = ReadPageCount(document);
         foreach (var (_, pageNumber) in bookmarks)
         {
             if (pageNumber > pageCount)
@@ -126,7 +208,7 @@ static class QpdfAPI
             SetKey(catalog, "/Outlines", outline);
         }
 
-        ThrowOnDocumentError();
+        ThrowOnDocumentError(document);
 
         if (!IsIndirectDictionary(outline))
             throw new InvalidOperationException("The PDF contains an invalid outline dictionary.");
@@ -163,7 +245,7 @@ static class QpdfAPI
 
         SetKey(outline, "/Last", last);
         SetKey(outline, "/Count", API.qpdf_oh_new_integer(document, visibleCount + bookmarks.Count));
-        ThrowOnDocumentError();
+        ThrowOnDocumentError(document);
 
         uint NewIndirectObject(string value) => API.qpdf_make_indirect_object(document, API.qpdf_oh_parse(document, value));
         uint GetKey(uint item, string key) => API.qpdf_oh_get_key(document, item, key);
@@ -198,44 +280,51 @@ static class QpdfAPI
 
         bool TryGetCount(uint item, out long count) =>
             API.qpdf_oh_get_value_as_longlong(document, GetKey(item, "/Count"), out count) != 0;
+    }
 
-        unsafe void ThrowOnDocumentError()
-        {
-            var error = API.qpdf_get_error(document);
-            if (error == IntPtr.Zero)
-                return;
+    private static unsafe void ThrowOnDocumentError(IntPtr document)
+    {
+        var error = API.qpdf_get_error(document);
+        if (error == IntPtr.Zero)
+            return;
 
-            var message = (byte*)API.qpdf_get_error_full_text(document, error);
-            var length = 0;
-            while (message[length] != 0)
-                length++;
+        var message = (byte*)API.qpdf_get_error_full_text(document, error);
+        var length = 0;
+        while (message[length] != 0)
+            length++;
 
-            throw new InvalidOperationException(Encoding.UTF8.GetString(message, length));
-        }
+        throw new InvalidOperationException(Encoding.UTF8.GetString(message, length));
     }
     
     private const int JobResultError = 2;
+    private const int CustomLogDestination = 4;
 
     #region Logging
     
-    private static int LoggingCallback(IntPtr data, int length, IntPtr udata)
+    private static int WriteCallback(IntPtr data, UIntPtr length, IntPtr context)
     {
-        var bytes = new byte[length];
-        Marshal.Copy(data, bytes, 0, length);
-
-        var handle = GCHandle.FromIntPtr(udata);
-        var stringBuilder = (StringBuilder)handle.Target;
-        stringBuilder?.Append(Encoding.UTF8.GetString(bytes));
-
-        return 0;
+        try
+        {
+            var stream = (MemoryStream)GCHandle.FromIntPtr(context).Target!;
+            var count = checked((int)length.ToUInt64());
+            var bytes = new byte[count];
+            Marshal.Copy(data, bytes, 0, count);
+            stream.Write(bytes, 0, count);
+            return 0;
+        }
+        catch
+        {
+            // Report callback failures to QPDF without letting managed exceptions cross into native code.
+            return 1;
+        }
     }
     
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate int CallbackDelegate(IntPtr data, int length, IntPtr udata);
+    private delegate int CallbackDelegate(IntPtr data, UIntPtr length, IntPtr context);
     
-    private static readonly CallbackDelegate LoggingCallbackDelegate = LoggingCallback;
+    private static readonly CallbackDelegate WriteCallbackDelegate = WriteCallback;
     
-    private static readonly IntPtr LoggingCallbackPointer = Marshal.GetFunctionPointerForDelegate(LoggingCallbackDelegate);
+    private static readonly IntPtr WriteCallbackPointer = Marshal.GetFunctionPointerForDelegate(WriteCallbackDelegate);
     
     #endregion
     
@@ -342,6 +431,9 @@ static class QpdfAPI
         
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = nameof(qpdflogger_set_error))]
         public static extern void qpdflogger_set_error(IntPtr loggerHandle, int destination, IntPtr callBackHandler, IntPtr udata);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void qpdflogger_set_save(IntPtr loggerHandle, int destination, IntPtr callback, IntPtr context, int onlyIfNotSet);
         
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = nameof(qpdfjob_set_logger))]
         public static extern void qpdfjob_set_logger(IntPtr jobHandle, IntPtr loggerHandle);
