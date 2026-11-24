@@ -19,7 +19,7 @@ static class QpdfAPI
     }
     
     public static void ExecuteJob(string jobJson, Func<byte[], byte[]>? transformMetadata = null,
-        IReadOnlyList<(string Title, int PageNumber)>? bookmarks = null, Action? beforeWrite = null)
+        IReadOnlyList<DocumentOperation.Bookmark>? bookmarks = null, Action? beforeWrite = null)
     {
         WithDocument(jobJson, (job, document, checkResult) =>
         {
@@ -63,8 +63,18 @@ static class QpdfAPI
         if (output == null)
             return new DocumentOperation.DocumentInfo(pageCount, Array.Empty<DocumentOperation.Bookmark>());
 
-        output.Position = 0;
-        using var reader = JsonReaderWriterFactory.CreateJsonReader(output, XmlDictionaryReaderQuotas.Max);
+        var buffer = output.GetBuffer();
+        var length = (int)output.Length;
+        var utf8 = new ReadOnlySpan<byte>(buffer, 0, length);
+        if (utf8.IndexOf("\uFFFE"u8) >= 0 || utf8.IndexOf("\uFFFF"u8) >= 0)
+        {
+            // The framework JSON reader accepts these Unicode characters only in escaped form.
+            var json = Encoding.UTF8.GetString(buffer, 0, length).Replace("\uFFFE", "\\uFFFE").Replace("\uFFFF", "\\uFFFF");
+            buffer = Encoding.UTF8.GetBytes(json);
+            length = buffer.Length;
+        }
+
+        using var reader = JsonReaderWriterFactory.CreateJsonReader(buffer, 0, length, XmlDictionaryReaderQuotas.Max);
         var outlines = XElement.Load(reader, LoadOptions.PreserveWhitespace).Element("outlines");
         return new DocumentOperation.DocumentInfo(pageCount, ReadBookmarks(outlines));
     }
@@ -190,14 +200,10 @@ static class QpdfAPI
         return pageCount;
     }
 
-    private static void AddBookmarks(IntPtr document, IReadOnlyList<(string Title, int PageNumber)> bookmarks)
+    private static void AddBookmarks(IntPtr document, IReadOnlyList<DocumentOperation.Bookmark> bookmarks)
     {
         var pageCount = ReadPageCount(document);
-        foreach (var (_, pageNumber) in bookmarks)
-        {
-            if (pageNumber > pageCount)
-                throw new ArgumentOutOfRangeException(nameof(pageNumber), pageNumber, $"The output document has {pageCount} pages.");
-        }
+        ValidatePageNumbers(bookmarks);
 
         var catalog = API.qpdf_get_root(document);
         var outline = GetKey(catalog, "/Outlines");
@@ -219,33 +225,60 @@ static class QpdfAPI
             (!IsNull(last) && (!IsIndirectDictionary(first) || !IsIndirectDictionary(last) || !IsNull(GetKey(last, "/Next")))))
             throw new InvalidOperationException("The PDF contains an invalid outline.");
 
-        var visibleCount = GetVisibleCount();
+        var visibleCount = GetVisibleCount() + AppendBookmarks(outline, last, bookmarks);
+        SetKey(outline, "/Count", API.qpdf_oh_new_integer(document, visibleCount));
+        ThrowOnDocumentError(document);
 
-        foreach (var (title, pageNumber) in bookmarks)
+        void ValidatePageNumbers(IReadOnlyList<DocumentOperation.Bookmark> entries)
         {
-            var item = NewIndirectObject("<< /Dest [null /Fit] >>");
-            var titleBytes = Encoding.UTF8.GetBytes(title);
-            var titleObject = API.qpdf_oh_new_binary_unicode_string(document, titleBytes, (UIntPtr)titleBytes.Length);
-            var page = API.qpdf_get_page_n(document, (UIntPtr)(pageNumber - 1));
-
-            API.qpdf_oh_set_array_item(document, GetKey(item, "/Dest"), 0, page);
-            SetKey(item, "/Title", titleObject);
-            SetKey(item, "/Parent", outline);
-
-            if (IsNull(last))
-                SetKey(outline, "/First", item);
-            else
+            foreach (var entry in entries)
             {
-                SetKey(last, "/Next", item);
-                SetKey(item, "/Prev", last);
-            }
+                if (entry.PageNumber is int pageNumber && (pageNumber < 1 || pageNumber > pageCount))
+                    throw new ArgumentOutOfRangeException(nameof(pageNumber), pageNumber, $"The output document has {pageCount} pages.");
 
-            last = item;
+                ValidatePageNumbers(entry.Children);
+            }
         }
 
-        SetKey(outline, "/Last", last);
-        SetKey(outline, "/Count", API.qpdf_oh_new_integer(document, visibleCount + bookmarks.Count));
-        ThrowOnDocumentError(document);
+        long AppendBookmarks(uint parent, uint previous, IReadOnlyList<DocumentOperation.Bookmark> entries)
+        {
+            var added = 0L;
+
+            foreach (var entry in entries)
+            {
+                var item = NewIndirectObject(entry.PageNumber.HasValue ? "<< /Dest [null /Fit] >>" : "<< >>");
+                var title = Encoding.UTF8.GetBytes(entry.Title);
+                SetKey(item, "/Title", API.qpdf_oh_new_binary_unicode_string(document, title, (UIntPtr)title.Length));
+                SetKey(item, "/Parent", parent);
+
+                if (entry.PageNumber is int pageNumber)
+                {
+                    var page = API.qpdf_get_page_n(document, (UIntPtr)(pageNumber - 1));
+                    API.qpdf_oh_set_array_item(document, GetKey(item, "/Dest"), 0, page);
+                }
+
+                if (IsNull(previous))
+                    SetKey(parent, "/First", item);
+                else
+                {
+                    SetKey(previous, "/Next", item);
+                    SetKey(item, "/Prev", previous);
+                }
+
+                if (entry.Children.Count > 0)
+                {
+                    var descendants = AppendBookmarks(item, GetKey(item, "/Last"), entry.Children);
+                    SetKey(item, "/Count", API.qpdf_oh_new_integer(document, descendants));
+                    added += descendants;
+                }
+
+                added++;
+                previous = item;
+            }
+
+            SetKey(parent, "/Last", previous);
+            return added;
+        }
 
         uint NewIndirectObject(string value) => API.qpdf_make_indirect_object(document, API.qpdf_oh_parse(document, value));
         uint GetKey(uint item, string key) => API.qpdf_oh_get_key(document, item, key);

@@ -47,6 +47,58 @@ public class DocumentOperationTests
     }
 
     [Test]
+    public void MergeDoesNotImportBookmarksByDefault()
+    {
+        GenerateSampleDocument("merge-default-primary.pdf", Colors.Red.Medium, 1);
+        GenerateDocumentWithBookmarks("merge-default-secondary.pdf", "Appendix");
+
+        const string outputPath = "operation-merge-default-bookmarks.pdf";
+        DocumentOperation
+            .LoadFile("merge-default-primary.pdf")
+            .MergeFile("merge-default-secondary.pdf")
+            .Save(outputPath);
+
+        var info = DocumentOperation.InspectFile(outputPath);
+        Assert.That(info.PageCount, Is.EqualTo(3));
+        Assert.That(info.Bookmarks, Is.Empty);
+    }
+
+    [Test]
+    public void PreserveMergedBookmarksRemapsSelectedPages()
+    {
+        const string appendixTitle = "First appendix \uFFFE";
+        GenerateSampleDocument("merge-outline-primary-input.pdf", Colors.Red.Medium, 2);
+        GenerateDocumentWithBookmarks("merge-outline-secondary.pdf", appendixTitle);
+        GenerateDocumentWithBookmarks("merge-outline-third.pdf", "Second appendix");
+
+        DocumentOperation
+            .LoadFile("merge-outline-primary-input.pdf")
+            .AddBookmark("Primary", 1)
+            .Save("merge-outline-primary.pdf");
+
+        const string outputPath = "operation-merge-preserved-bookmarks.pdf";
+        DocumentOperation
+            .LoadFile("merge-outline-primary.pdf")
+            .AddBookmark("Manual", 5)
+            .TakePages("1")
+            .MergeFile("merge-outline-secondary.pdf", "2,1,2")
+            .TakePages("2")
+            .MergeFile("merge-outline-third.pdf", "1-2,x1")
+            .PreserveMergedBookmarks()
+            .Save(outputPath);
+
+        var info = DocumentOperation.InspectFile(outputPath);
+        Assert.That(info.PageCount, Is.EqualTo(6));
+        Assert.That(info.BookmarkCount, Is.EqualTo(7));
+        Assert.That(info.Bookmarks.Select(bookmark => (bookmark.Title, bookmark.PageNumber)),
+            Is.EqualTo(new (string, int?)[] { ("Primary", 1), ("Report", 3), ("Legacy destination", 3), ("Report", null), ("Manual", 5) }));
+
+        var children = new[] { info.Bookmarks[1].Children.Single(), info.Bookmarks[3].Children.Single() };
+        Assert.That(children.Select(bookmark => (bookmark.Title, bookmark.PageNumber)),
+            Is.EqualTo(new (string, int?)[] { (appendixTitle, 2), ("Second appendix", 6) }));
+    }
+
+    [Test]
     public void AddBookmarksToMergedDocument()
     {
         GenerateSampleDocument("bookmarks-report.pdf", Colors.Red.Medium, 2);

@@ -255,7 +255,8 @@ public sealed class DocumentOperation
     
     internal JobConfiguration Configuration { get; private set; }
     private List<string> MetadataExtensions { get; } = new();
-    private List<(string Title, int PageNumber)>? Bookmarks { get; set; }
+    private List<Bookmark>? Bookmarks { get; set; }
+    private bool ImportMergedBookmarks { get; set; }
 
     private DocumentOperation()
     {
@@ -330,6 +331,16 @@ public sealed class DocumentOperation
     }
 
     /// <summary>
+    /// Preserves bookmarks from merged files when their destinations are included in the output.
+    /// Imported bookmarks follow the primary document's outline and precede manually added bookmarks.
+    /// </summary>
+    public DocumentOperation PreserveMergedBookmarks()
+    {
+        ImportMergedBookmarks = true;
+        return this;
+    }
+
+    /// <summary>
     /// Applies an underlay to the document using the specified configuration.
     /// The underlay pages are drawn beneath the target pages in the output file, potentially obscured by the original content.
     /// </summary>
@@ -397,7 +408,7 @@ public sealed class DocumentOperation
         if (pageNumber < 1)
             throw new ArgumentOutOfRangeException(nameof(pageNumber));
 
-        (Bookmarks ??= new()).Add((title, pageNumber));
+        (Bookmarks ??= new()).Add(new Bookmark(title, pageNumber, Array.Empty<Bookmark>()));
         return this;
     }
     
@@ -582,10 +593,60 @@ public sealed class DocumentOperation
             ? xmp => XmpMetadataExtension.Extend(xmp, MetadataExtensions)
             : null;
 
-        QpdfAPI.ExecuteJob(json, transformMetadata, Bookmarks, () =>
+        QpdfAPI.ExecuteJob(json, transformMetadata, GetOutputBookmarks(), () =>
         {
             if (File.Exists(filePath))
                 File.Delete(filePath);
         });
+    }
+
+    private IReadOnlyList<Bookmark>? GetOutputBookmarks()
+    {
+        var pages = Configuration.Pages;
+        if (!ImportMergedBookmarks || pages == null || pages.All(segment => segment.File == "."))
+            return Bookmarks;
+
+        var result = new List<Bookmark>();
+        var pageOffset = 0;
+
+        foreach (var segment in pages)
+        {
+            var isPrimarySegment = segment.File == ".";
+            var source = isPrimarySegment ? Configuration.InputFile : segment.File;
+            var password = source == Configuration.InputFile ? Configuration.Password : null;
+            var info = QpdfAPI.InspectFile(source, password, segment.Range, readBookmarks: !isPrimarySegment);
+
+            if (!isPrimarySegment)
+                result.AddRange(SelectBookmarks(info.Bookmarks, 1, info.PageCount, pageOffset));
+
+            pageOffset += info.PageCount;
+        }
+
+        if (Bookmarks != null)
+            result.AddRange(Bookmarks);
+
+        return result;
+    }
+
+    private static IReadOnlyList<Bookmark> SelectBookmarks(IReadOnlyList<Bookmark> bookmarks,
+        int firstPage, int lastPage, int pageOffset)
+    {
+        if (bookmarks.Count == 0)
+            return Array.Empty<Bookmark>();
+
+        var result = new List<Bookmark>();
+
+        foreach (var bookmark in bookmarks)
+        {
+            var children = SelectBookmarks(bookmark.Children, firstPage, lastPage, pageOffset);
+            var destination = bookmark.PageNumber is int page && page >= firstPage && page <= lastPage
+                ? page + pageOffset
+                : (int?)null;
+
+            if (destination.HasValue || children.Count > 0)
+                result.Add(new Bookmark(bookmark.Title, destination, children));
+        }
+
+        return result;
     }
 }
