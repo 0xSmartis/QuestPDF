@@ -60,6 +60,46 @@ public sealed class DocumentOperation
     }
 
     /// <summary>
+    /// A range of pages bounded by bookmarks in a source PDF.
+    /// </summary>
+    public sealed class BookmarkPart
+    {
+        private readonly string SourceFilePath;
+        private readonly string? Password;
+        private readonly IReadOnlyList<Bookmark> Bookmarks;
+
+        internal BookmarkPart(string title, int firstPage, int lastPage, string sourceFilePath, string? password, IReadOnlyList<Bookmark> bookmarks)
+        {
+            Title = title;
+            FirstPage = firstPage;
+            LastPage = lastPage;
+            SourceFilePath = sourceFilePath;
+            Password = password;
+            Bookmarks = bookmarks;
+        }
+
+        /// <summary>The title of the bookmark marking this part.</summary>
+        public string Title { get; }
+
+        /// <summary>The first page of this part in the source PDF, numbered from one.</summary>
+        public int FirstPage { get; }
+
+        /// <summary>The last page of this part in the source PDF, inclusive.</summary>
+        public int LastPage { get; }
+
+        /// <summary>Saves the selected pages and their local bookmarks to a PDF file.</summary>
+        /// <param name="filePath">The path where the output file will be saved.</param>
+        /// <remarks>The source file must remain available and unchanged until the part is saved.</remarks>
+        public void Save(string filePath)
+        {
+            var operation = LoadFile(SourceFilePath, Password)
+                .TakePages(FormattableString.Invariant($"{FirstPage}-{LastPage}"));
+            operation.ReplacementBookmarks = Bookmarks;
+            operation.Save(filePath);
+        }
+    }
+
+    /// <summary>
     /// Represents configuration options for applying an overlay or underlay to a PDF document using qpdf.
     /// </summary>
     public sealed class LayerConfiguration
@@ -256,6 +296,7 @@ public sealed class DocumentOperation
     internal JobConfiguration Configuration { get; private set; }
     private List<string> MetadataExtensions { get; } = new();
     private List<Bookmark>? Bookmarks { get; set; }
+    private IReadOnlyList<Bookmark>? ReplacementBookmarks { get; set; }
     private bool ImportMergedBookmarks { get; set; }
 
     private DocumentOperation()
@@ -289,7 +330,40 @@ public sealed class DocumentOperation
     /// <include file='../Resources/Documentation.xml' path='documentation/doc[@for="filePath.remarks"]/*' />
     public static DocumentInfo InspectFile(string filePath, string? password = null)
     {
-        return QpdfAPI.InspectFile(PathHelpers.ResolveResourceFilePath(filePath), password);
+        return QpdfAPI.InspectFile(Path.GetFullPath(PathHelpers.ResolveResourceFilePath(filePath)), password);
+    }
+
+    /// <summary>
+    /// Finds parts of a PDF delimited by top-level bookmarks with local destinations.
+    /// The first part includes any pages before its bookmark. Call <see cref="BookmarkPart.Save"/> to write a part.
+    /// </summary>
+    /// <param name="filePath">The path to the source PDF file.</param>
+    /// <param name="titlePrefix">The case-sensitive prefix identifying the bookmarks to split at.</param>
+    /// <param name="password">The password for the PDF file, if it is password-protected.</param>
+    public static IReadOnlyList<BookmarkPart> SplitFileAtBookmarks(string filePath, string titlePrefix, string? password = null)
+    {
+        if (string.IsNullOrEmpty(titlePrefix))
+            throw new ArgumentException("The bookmark title prefix must not be empty.", nameof(titlePrefix));
+
+        var source = Path.GetFullPath(PathHelpers.ResolveResourceFilePath(filePath));
+        var info = QpdfAPI.InspectFile(source, password);
+        var markers = info.Bookmarks
+            .Where(bookmark => bookmark.PageNumber.HasValue && bookmark.Title.StartsWith(titlePrefix, StringComparison.Ordinal))
+            .GroupBy(bookmark => bookmark.PageNumber!.Value)
+            .OrderBy(group => group.Key)
+            .Select(group => group.First())
+            .ToArray();
+
+        var parts = new BookmarkPart[markers.Length];
+        for (var index = 0; index < markers.Length; index++)
+        {
+            var firstPage = index == 0 ? 1 : markers[index].PageNumber!.Value;
+            var lastPage = index + 1 == markers.Length ? info.PageCount : markers[index + 1].PageNumber!.Value - 1;
+            var bookmarks = SelectBookmarks(info.Bookmarks, firstPage, lastPage, 1 - firstPage);
+            parts[index] = new BookmarkPart(markers[index].Title, firstPage, lastPage, source, password, bookmarks);
+        }
+
+        return Array.AsReadOnly(parts);
     }
     
     /// <summary>
@@ -593,11 +667,11 @@ public sealed class DocumentOperation
             ? xmp => XmpMetadataExtension.Extend(xmp, MetadataExtensions)
             : null;
 
-        QpdfAPI.ExecuteJob(json, transformMetadata, GetOutputBookmarks(), () =>
+        QpdfAPI.ExecuteJob(json, transformMetadata, ReplacementBookmarks ?? GetOutputBookmarks(), () =>
         {
             if (File.Exists(filePath))
                 File.Delete(filePath);
-        });
+        }, replaceBookmarks: ReplacementBookmarks != null);
     }
 
     private IReadOnlyList<Bookmark>? GetOutputBookmarks()

@@ -19,15 +19,15 @@ static class QpdfAPI
     }
     
     public static void ExecuteJob(string jobJson, Func<byte[], byte[]>? transformMetadata = null,
-        IReadOnlyList<DocumentOperation.Bookmark>? bookmarks = null, Action? beforeWrite = null)
+        IReadOnlyList<DocumentOperation.Bookmark>? bookmarks = null, Action? beforeWrite = null, bool replaceBookmarks = false)
     {
         WithDocument(jobJson, (job, document, checkResult) =>
         {
             if (transformMetadata != null)
                 TransformMetadata(job, document, transformMetadata, checkResult);
 
-            if (bookmarks is { Count: > 0 })
-                AddBookmarks(document, bookmarks);
+            if (replaceBookmarks || bookmarks is { Count: > 0 })
+                WriteBookmarks(document, bookmarks ?? Array.Empty<DocumentOperation.Bookmark>(), replaceBookmarks);
 
             beforeWrite?.Invoke();
             checkResult(API.qpdfjob_write_qpdf(job, document));
@@ -44,21 +44,22 @@ static class QpdfAPI
             Pages = pageSelector == null
                 ? null
                 : new[] { new JobConfiguration.PageConfiguration { File = ".", Range = pageSelector } },
-            OutputFile = readBookmarks ? "-" : null,
-            Json = readBookmarks ? "2" : null,
-            JsonKey = readBookmarks ? new[] { "outlines" } : null,
-            ShowNpages = readBookmarks ? null : string.Empty
+            ShowNpages = string.Empty
         };
 
         var pageCount = 0;
         using var output = readBookmarks ? new MemoryStream() : null;
-        WithDocument(QpdfJobSerializer.Serialize(configuration), (job, document, checkResult) =>
+        WithDocument(QpdfJobSerializer.Serialize(configuration), (_, document, _) =>
         {
             pageCount = ReadPageCount(document);
 
             if (output != null)
-                checkResult(API.qpdfjob_write_qpdf(job, document));
-        }, output);
+            {
+                // Keep the real input path separate from the JSON writer's stdout marker.
+                const string outlineJob = """{"empty":"","outputFile":"-","json":"2","jsonKey":["outlines"]}""";
+                WithJob(outlineJob, (writer, checkResult) => checkResult(API.qpdfjob_write_qpdf(writer, document)), output);
+            }
+        });
 
         if (output == null)
             return new DocumentOperation.DocumentInfo(pageCount, Array.Empty<DocumentOperation.Bookmark>());
@@ -97,8 +98,26 @@ static class QpdfAPI
         return bookmarks;
     }
 
-    private static void WithDocument(string jobJson, Action<IntPtr, IntPtr, Action<int>> process,
-        MemoryStream? output = null)
+    private static void WithDocument(string jobJson, Action<IntPtr, IntPtr, Action<int>> process)
+    {
+        WithJob(jobJson, (job, checkResult) =>
+        {
+            var document = API.qpdfjob_create_qpdf(job);
+            if (document == IntPtr.Zero)
+                checkResult(JobResultError);
+
+            try
+            {
+                process(job, document, checkResult);
+            }
+            finally
+            {
+                API.qpdf_cleanup(ref document);
+            }
+        });
+    }
+
+    private static void WithJob(string jobJson, Action<IntPtr, Action<int>> process, MemoryStream? output = null)
     {
         QpdfNativeDependencyCompatibilityChecker.Test();
 
@@ -108,7 +127,6 @@ static class QpdfAPI
 
         var logger = IntPtr.Zero;
         var jobHandle = IntPtr.Zero;
-        var documentHandle = IntPtr.Zero;
 
         try
         {
@@ -127,19 +145,10 @@ static class QpdfAPI
             API.qpdfjob_set_logger(jobHandle, logger);
             ThrowOnJobError(API.qpdfjob_initialize_from_json(jobHandle, jobJson));
 
-            // load the document and apply all operations
-            documentHandle = API.qpdfjob_create_qpdf(jobHandle);
-
-            if (documentHandle == IntPtr.Zero)
-                ThrowOnJobError(JobResultError);
-
-            process(jobHandle, documentHandle, ThrowOnJobError);
+            process(jobHandle, ThrowOnJobError);
         }
         finally
         {
-            if (documentHandle != IntPtr.Zero)
-                API.qpdf_cleanup(ref documentHandle);
-
             if (jobHandle != IntPtr.Zero)
                 API.qpdfjob_cleanup(ref jobHandle);
 
@@ -200,12 +209,21 @@ static class QpdfAPI
         return pageCount;
     }
 
-    private static void AddBookmarks(IntPtr document, IReadOnlyList<DocumentOperation.Bookmark> bookmarks)
+    private static void WriteBookmarks(IntPtr document, IReadOnlyList<DocumentOperation.Bookmark> bookmarks, bool replace)
     {
         var pageCount = ReadPageCount(document);
         ValidatePageNumbers(bookmarks);
 
         var catalog = API.qpdf_get_root(document);
+        if (replace)
+        {
+            API.qpdf_oh_remove_key(document, catalog, "/Outlines");
+            ThrowOnDocumentError(document);
+
+            if (bookmarks.Count == 0)
+                return;
+        }
+
         var outline = GetKey(catalog, "/Outlines");
 
         if (IsNull(outline))
@@ -441,6 +459,9 @@ static class QpdfAPI
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void qpdf_oh_replace_key(IntPtr document, uint item, string key, uint value);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void qpdf_oh_remove_key(IntPtr document, uint item, string key);
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int qpdf_oh_get_value_as_longlong(IntPtr document, uint item, out long value);

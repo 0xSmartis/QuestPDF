@@ -6,6 +6,7 @@ using NUnit.Framework;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
 using QuestPDF.Infrastructure;
+using UglyToad.PdfPig;
 
 namespace QuestPDF.UnitTests;
 
@@ -197,6 +198,104 @@ public class DocumentOperationTests
         Assert.That(child.Title, Is.EqualTo(title));
         Assert.That(child.PageNumber, Is.EqualTo(2));
         Assert.That(child.Children, Is.Empty);
+    }
+
+    [Test]
+    public void SplitMergedFileAtBookmarks()
+    {
+        GenerateSampleDocument("split-primary.pdf", Colors.Red.Medium, 2);
+        GenerateDocumentWithBookmarks("split-bookmarked.pdf", "page_Nested");
+        GenerateSampleDocument("split-last.pdf", Colors.Blue.Medium, 2);
+
+        const string mergedPath = "operation-split-merged.pdf";
+        DocumentOperation
+            .LoadFile("split-primary.pdf")
+            .MergeFile("split-bookmarked.pdf")
+            .MergeFile("split-last.pdf", "2,1")
+            .PreserveMergedBookmarks()
+            .AddBookmark("page_Second", 4)
+            .AddBookmark("PAGE_Case", 3)
+            .AddBookmark("page_First", 2)
+            .AddBookmark("page_Duplicate", 2)
+            .Save(mergedPath);
+
+        var parts = DocumentOperation.SplitFileAtBookmarks(mergedPath, "page_");
+        Assert.That(parts.Select(part => (part.Title, part.FirstPage, part.LastPage)),
+            Is.EqualTo(new[] { ("page_First", 1, 3), ("page_Second", 4, 6) }));
+
+        const string firstPath = "operation-split-first.pdf";
+        const string secondPath = "operation-split-second.pdf";
+        parts[0].Save(firstPath);
+        parts[1].Save(secondPath);
+
+        using var first = PdfDocument.Open(firstPath);
+        using var second = PdfDocument.Open(secondPath);
+        Assert.That(first.GetPages().Select(page => page.Text), Is.EqualTo(new[] { "Page 1", "Page 2", "" }));
+        Assert.That(second.GetPages().Select(page => page.Text), Is.EqualTo(new[] { "", "Page 2", "Page 1" }));
+
+        var firstOutline = DocumentOperation.InspectFile(firstPath).Bookmarks;
+        Assert.That(firstOutline.Select(bookmark => (bookmark.Title, bookmark.PageNumber)),
+            Is.EqualTo(new (string, int?)[] { ("Report", 3), ("Legacy destination", 3), ("PAGE_Case", 3), ("page_First", 2), ("page_Duplicate", 2) }));
+        Assert.That(firstOutline[0].Children, Is.Empty);
+
+        var secondOutline = DocumentOperation.InspectFile(secondPath).Bookmarks;
+        Assert.That(secondOutline.Select(bookmark => (bookmark.Title, bookmark.PageNumber)),
+            Is.EqualTo(new (string, int?)[] { ("Report", null), ("page_Second", 1) }));
+        var child = secondOutline[0].Children.Single();
+        Assert.That((child.Title, child.PageNumber), Is.EqualTo(("page_Nested", (int?)1)));
+    }
+
+    [Test]
+    public void SplitFileWithoutMatchingTopLevelBookmarksReturnsNoParts()
+    {
+        const string inputPath = "split-no-markers.pdf";
+        GenerateDocumentWithBookmarks(inputPath, "page_Nested");
+
+        Assert.That(DocumentOperation.SplitFileAtBookmarks(inputPath, "page_"), Is.Empty);
+    }
+
+    [Test]
+    public void SplitPdfNamedDash()
+    {
+        const string inputPath = "-";
+        const string fixturePath = "split-dash-fixture.pdf";
+        const string outputPath = "operation-split-dash.pdf";
+        GenerateDocumentWithBookmarks(fixturePath, "Appendix");
+        File.Copy(fixturePath, inputPath);
+
+        try
+        {
+            DocumentOperation.SplitFileAtBookmarks(inputPath, "Report").Single().Save(outputPath);
+
+            var info = DocumentOperation.InspectFile(outputPath);
+            Assert.That(info.PageCount, Is.EqualTo(2));
+            Assert.That(info.Bookmarks.Select(bookmark => bookmark.Title), Is.EqualTo(new[] { "Report", "Legacy destination" }));
+        }
+        finally
+        {
+            File.Delete(inputPath);
+        }
+    }
+
+    [Test]
+    public void SplitBookmarkPartCanSavePasswordProtectedSource()
+    {
+        const string password = "split-user";
+        const string sourcePath = "split-encrypted.pdf";
+        const string outputPath = "operation-split-encrypted.pdf";
+        GenerateSampleDocument("split-encryption-input.pdf", Colors.Red.Medium, 2);
+
+        DocumentOperation
+            .LoadFile("split-encryption-input.pdf")
+            .AddBookmark("page_Only", 2)
+            .Encrypt(new DocumentOperation.Encryption256Bit { UserPassword = password, OwnerPassword = "split-owner" })
+            .Save(sourcePath);
+
+        DocumentOperation.SplitFileAtBookmarks(sourcePath, "page_", password).Single().Save(outputPath);
+
+        var info = DocumentOperation.InspectFile(outputPath, password);
+        Assert.That(info.PageCount, Is.EqualTo(2));
+        Assert.That(info.Bookmarks.Single().PageNumber, Is.EqualTo(2));
     }
     
     [Test]
